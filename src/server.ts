@@ -600,11 +600,14 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
       }
     }
     addMessage(id, { role: 'user', content: userText });
-    const { alpha, beta, gamma } = config.retrieval;
-    const mem = t.userId ? getMemory(t.userId) : undefined;
-    if (t.userId) decayPreferences(t.userId);
-    const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
-  const results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
+    let results: Array<{ chunk: any; score: number }> = [];
+    if (config.content.retrievalEnabled) {
+      const { alpha, beta, gamma } = config.retrieval;
+      const mem = t.userId ? getMemory(t.userId) : undefined;
+      if (t.userId) decayPreferences(t.userId);
+      const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
+      results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
+    }
   const prompt = await buildPersonalizedPrompt(query, results, t.userId, id);
     const history = getHistory(id);
     // SSE setup
