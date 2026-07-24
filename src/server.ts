@@ -100,7 +100,7 @@ const retrievalCache = new LRUCache<any>(300, 3_000_000); // about ~3MB budget
 const generationCache = new LRUCache<any>(200, 4_000_000);
 
 app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', env: config.env, vector: config.vector.kind, embedding: config.embedding.provider, voiceConfigured: !!(config.voice.hf.apiToken && config.voice.hf.ttsModel) });
+  res.json({ status: 'ok', env: config.env, vector: config.vector.kind, embedding: config.embedding.provider, voiceConfigured: !!(config.voice.elevenlabs.apiKey && config.voice.elevenlabs.voiceId) });
 });
 
 // Lightweight corpus stats to verify ingestion progress/completion
@@ -708,13 +708,13 @@ app.get('/metrics', (_req: Request, res: Response) => {
   });
 });
 
-// Text-to-Speech endpoint (Hugging Face)
+// Text-to-Speech endpoint (ElevenLabs)
 app.post('/tts', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { text, format, parameters } = req.body || {};
     if (!text || typeof text !== 'string') return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing text' } });
-    if (!config.voice.hf.apiToken || !config.voice.hf.ttsModel) {
-      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set HUGGINGFACE_API_TOKEN and HF_TTS_MODEL.' } });
+    if (!config.voice.elevenlabs.apiKey || !config.voice.elevenlabs.voiceId) {
+      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID.' } });
     }
     const audio = await synthesizeSpeech(text, (format || 'mp3'), parameters);
     res.setHeader('Content-Type', `audio/${format || 'mp3'}`);
@@ -727,8 +727,8 @@ app.post('/generate/voice', async (req: Request, res: Response, next: NextFuncti
   try {
     const { query, userId, topK = 5, temperature, maxTokens, format = 'mp3', parameters } = req.body || {};
     if (!query) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing query' } });
-    if (!config.voice.hf.apiToken || !config.voice.hf.ttsModel) {
-      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set HUGGINGFACE_API_TOKEN and HF_TTS_MODEL.' } });
+    if (!config.voice.elevenlabs.apiKey || !config.voice.elevenlabs.voiceId) {
+      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID.' } });
     }
     let results: Array<{ chunk: any; score: number }> = [];
     if (config.content.retrievalEnabled) {
@@ -812,7 +812,7 @@ app.get('/admin', (_req: Request, res: Response) => {
     <tbody>
       <tr><td>Vector DB</td><td><span class="badge badge-green">Qdrant</span></td><td>${process.env.QDRANT_URL || 'http://localhost:6333'}</td></tr>
       <tr><td>Embedding</td><td><span class="badge ${process.env.OPENAI_API_KEY ? 'badge-green' : 'badge-gray'}">${process.env.EMBEDDING_PROVIDER || 'local'}</span></td><td>${process.env.OPENAI_API_KEY ? 'API key configured' : '⚠️ No OPENAI_API_KEY — using stub'}</td></tr>
-      <tr><td>Voice (TTS)</td><td><span class="badge ${process.env.HUGGINGFACE_API_TOKEN ? 'badge-green' : 'badge-gray'}">${process.env.HUGGINGFACE_API_TOKEN ? 'Configured' : 'Not configured'}</span></td><td>${process.env.HF_TTS_MODEL || 'parler-tts/parler-tts-large-v1'}</td></tr>
+      <tr><td>Voice (TTS)</td><td><span class="badge ${process.env.ELEVENLABS_API_KEY ? 'badge-green' : 'badge-gray'}">${process.env.ELEVENLABS_API_KEY ? 'Configured' : 'Not configured'}</span></td><td>ElevenLabs${process.env.ELEVENLABS_VOICE_ID ? ` (voice ${process.env.ELEVENLABS_VOICE_ID})` : ''}</td></tr>
     </tbody>
   </table>
 </main>
