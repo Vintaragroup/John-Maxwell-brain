@@ -20,6 +20,10 @@ function getEmbedder(): Embedder {
 }
 
 export async function indexChunks(chunks: Chunk[]): Promise<void> {
+  // toChunks() may filter every chunk of a doc out as a near-duplicate (dedup.ts),
+  // leaving nothing to index. That's a valid outcome, not a failure — upserting
+  // an empty vector array would throw ("requires non-empty vectors").
+  if (!chunks.length) return;
   const embeddings = await getEmbedder().embed(chunks.map(c => c.content));
   const points = embeddings.map((e, i) => ({
     id: chunks[i].id,
