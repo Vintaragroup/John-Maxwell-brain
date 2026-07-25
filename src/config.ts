@@ -33,12 +33,10 @@ export const config = {
     model: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini'
   },
   voice: {
-    hf: {
-      apiToken: process.env.HUGGINGFACE_API_TOKEN || '',
-      ttsModel: process.env.HF_TTS_MODEL || '',
-      parameters: process.env.HF_TTS_PARAMETERS || '',
-      endpoint: process.env.HF_TTS_ENDPOINT || '',
-      altToken: process.env.HF_TOKEN || ''
+    elevenlabs: {
+      apiKey: process.env.ELEVENLABS_API_KEY || '',
+      voiceId: process.env.ELEVENLABS_VOICE_ID || '',
+      modelId: process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2'
     }
   },
   context: {

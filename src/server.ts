@@ -11,7 +11,7 @@ import { indexChunks, search, searchDetailed, getIndexStats } from './retrieve';
 import { LRUCache, makeRetrievalKey } from './cache';
 import { buildPrompt } from './prompt';
 import { dedupStats } from './dedup';
-import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, ChatMessage } from './generate';
+import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage } from './generate';
 import { getMemory, upsertMemory, listMemories, recordFeedback, decayPreferences } from './memory';
 import { listConfigHistory, currentRuntimeConfig, updateRuntimeConfig } from './admin_config';
 import { createThread, addMessage, getThread, getHistory, listThreads, setThreadUser, setCoachingSummary, getCoachingSummary } from './conversation';
@@ -21,7 +21,7 @@ import { getRelevantPersonaSnippet } from './persona';
 import { UserProfile } from './types';
 import fs from 'fs';
 import { checkRateLimit, remainingTokens } from './rate_limit';
-import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, trackEvent, getAnalyticsSummary, saveRating } from './db';
+import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers } from './db';
 
 const app = express();
 // CORS for frontend apps
@@ -100,7 +100,7 @@ const retrievalCache = new LRUCache<any>(300, 3_000_000); // about ~3MB budget
 const generationCache = new LRUCache<any>(200, 4_000_000);
 
 app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', env: config.env, vector: config.vector.kind, embedding: config.embedding.provider, voiceConfigured: !!(config.voice.hf.apiToken && config.voice.hf.ttsModel) });
+  res.json({ status: 'ok', env: config.env, vector: config.vector.kind, embedding: config.embedding.provider, voiceConfigured: !!(config.voice.elevenlabs.apiKey && config.voice.elevenlabs.voiceId) });
 });
 
 // Lightweight corpus stats to verify ingestion progress/completion
@@ -196,6 +196,55 @@ app.post('/profile', (req: Request, res: Response) => {
   profiles.set(p.userId, p);
   upsertProfile({ userId: p.userId, firstName: p.firstName, role: p.role, industry: p.industry, currentChallenge: p.currentChallenge, goals: p.goals, tonePref: p.tonePref, brevityPref: p.brevityPref });
   res.json({ ok: true, profile: p });
+});
+
+const ReflectSchema = z.object({
+  userId: z.string().min(1),
+  questionId: z.string().min(1),
+  question: z.string().min(1),
+  answer: z.string().min(1)
+});
+
+// Insights Q&A: interpret one answer, fold it into the user's structured profile
+// fields and their growing markdown narrative.
+app.post('/profile/reflect', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId, questionId, question, answer } = ReflectSchema.parse(req.body ?? {});
+    const existing: UserProfile = profiles.get(userId) || (getDbProfile(userId) as UserProfile | undefined) || { userId };
+    const result = await extractProfileReflection({
+      existingProfile: existing,
+      existingNarrative: existing.profileNarrative,
+      question,
+      answer
+    });
+    const updated: UserProfile = {
+      ...existing,
+      ...result.profileUpdates,
+      goals: result.profileUpdates.goals ?? existing.goals,
+      userId,
+      profileNarrative: result.narrative
+    };
+    profiles.set(userId, updated);
+    upsertProfile({
+      userId,
+      firstName: updated.firstName,
+      role: updated.role,
+      industry: updated.industry,
+      currentChallenge: updated.currentChallenge,
+      goals: updated.goals,
+      tonePref: updated.tonePref,
+      brevityPref: updated.brevityPref,
+      profileNarrative: updated.profileNarrative
+    });
+    saveReflectionAnswer(userId, questionId, question, answer, result.profileUpdates);
+    res.json({ ok: true, profileUpdates: result.profileUpdates, narrative: result.narrative, profile: updated });
+  } catch (err) { next(err); }
+});
+
+app.get('/profile/reflect', (req: Request, res: Response) => {
+  const userId = String((req.query.userId || '').toString() || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  res.json({ answers: getReflectionAnswers(userId) });
 });
 
 app.get('/goals', (req: Request, res: Response) => {
@@ -525,8 +574,15 @@ app.post('/conversation/start', (req: Request, res: Response) => {
   res.json({ id: t.id, openingMessage: opening.content });
 });
 
-app.get('/conversation', (_req: Request, res: Response) => {
-  res.json({ threads: listThreads() });
+app.get('/conversation', (req: Request, res: Response) => {
+  const userId = req.query.userId ? String(req.query.userId) : undefined;
+  res.json({ threads: listThreads(50, userId) });
+});
+
+app.get('/conversation/:id', (req: Request, res: Response) => {
+  const t = getThread(req.params.id);
+  if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  res.json({ thread: t });
 });
 
 app.post('/conversation/:id/send', async (req: Request, res: Response, next: NextFunction) => {
@@ -600,11 +656,14 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
       }
     }
     addMessage(id, { role: 'user', content: userText });
-    const { alpha, beta, gamma } = config.retrieval;
-    const mem = t.userId ? getMemory(t.userId) : undefined;
-    if (t.userId) decayPreferences(t.userId);
-    const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
-  const results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
+    let results: Array<{ chunk: any; score: number }> = [];
+    if (config.content.retrievalEnabled) {
+      const { alpha, beta, gamma } = config.retrieval;
+      const mem = t.userId ? getMemory(t.userId) : undefined;
+      if (t.userId) decayPreferences(t.userId);
+      const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
+      results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
+    }
   const prompt = await buildPersonalizedPrompt(query, results, t.userId, id);
     const history = getHistory(id);
     // SSE setup
@@ -705,13 +764,13 @@ app.get('/metrics', (_req: Request, res: Response) => {
   });
 });
 
-// Text-to-Speech endpoint (Hugging Face)
+// Text-to-Speech endpoint (ElevenLabs)
 app.post('/tts', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { text, format, parameters } = req.body || {};
     if (!text || typeof text !== 'string') return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing text' } });
-    if (!config.voice.hf.apiToken || !config.voice.hf.ttsModel) {
-      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set HUGGINGFACE_API_TOKEN and HF_TTS_MODEL.' } });
+    if (!config.voice.elevenlabs.apiKey || !config.voice.elevenlabs.voiceId) {
+      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID.' } });
     }
     const audio = await synthesizeSpeech(text, (format || 'mp3'), parameters);
     res.setHeader('Content-Type', `audio/${format || 'mp3'}`);
@@ -724,8 +783,8 @@ app.post('/generate/voice', async (req: Request, res: Response, next: NextFuncti
   try {
     const { query, userId, topK = 5, temperature, maxTokens, format = 'mp3', parameters } = req.body || {};
     if (!query) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing query' } });
-    if (!config.voice.hf.apiToken || !config.voice.hf.ttsModel) {
-      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set HUGGINGFACE_API_TOKEN and HF_TTS_MODEL.' } });
+    if (!config.voice.elevenlabs.apiKey || !config.voice.elevenlabs.voiceId) {
+      return res.status(400).json({ error: { code: 'TTS_NOT_CONFIGURED', message: 'Voice is not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID.' } });
     }
     let results: Array<{ chunk: any; score: number }> = [];
     if (config.content.retrievalEnabled) {
@@ -809,7 +868,7 @@ app.get('/admin', (_req: Request, res: Response) => {
     <tbody>
       <tr><td>Vector DB</td><td><span class="badge badge-green">Qdrant</span></td><td>${process.env.QDRANT_URL || 'http://localhost:6333'}</td></tr>
       <tr><td>Embedding</td><td><span class="badge ${process.env.OPENAI_API_KEY ? 'badge-green' : 'badge-gray'}">${process.env.EMBEDDING_PROVIDER || 'local'}</span></td><td>${process.env.OPENAI_API_KEY ? 'API key configured' : '⚠️ No OPENAI_API_KEY — using stub'}</td></tr>
-      <tr><td>Voice (TTS)</td><td><span class="badge ${process.env.HUGGINGFACE_API_TOKEN ? 'badge-green' : 'badge-gray'}">${process.env.HUGGINGFACE_API_TOKEN ? 'Configured' : 'Not configured'}</span></td><td>${process.env.HF_TTS_MODEL || 'parler-tts/parler-tts-large-v1'}</td></tr>
+      <tr><td>Voice (TTS)</td><td><span class="badge ${process.env.ELEVENLABS_API_KEY ? 'badge-green' : 'badge-gray'}">${process.env.ELEVENLABS_API_KEY ? 'Configured' : 'Not configured'}</span></td><td>ElevenLabs${process.env.ELEVENLABS_VOICE_ID ? ` (voice ${process.env.ELEVENLABS_VOICE_ID})` : ''}</td></tr>
     </tbody>
   </table>
 </main>

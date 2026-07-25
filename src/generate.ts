@@ -166,6 +166,84 @@ export async function *streamChatAnswer(prompt: PromptParts, history: ChatMessag
   }
 }
 
+export interface ReflectionProfileUpdates {
+  firstName?: string;
+  role?: string;
+  industry?: string;
+  currentChallenge?: string;
+  goals?: string[];
+  tonePref?: 'direct' | 'empathetic';
+  brevityPref?: 'short' | 'normal';
+}
+
+export interface ReflectionResult {
+  profileUpdates: ReflectionProfileUpdates;
+  narrative: string;
+}
+
+// Interprets one Q&A answer from the Insights reflection flow: extracts structured
+// profile updates and rewrites the running markdown narrative to fold it in.
+export async function extractProfileReflection(input: {
+  existingProfile: Record<string, any>;
+  existingNarrative?: string;
+  question: string;
+  answer: string;
+}): Promise<ReflectionResult> {
+  const apiKey = config.embedding.openaiApiKey;
+  const { existingProfile, existingNarrative, question, answer } = input;
+  if (!apiKey) {
+    // Stub: no confident field extraction without a model; just fold the raw
+    // Q&A into the narrative so the feature still visibly does something.
+    const stubNarrative = `${existingNarrative ? existingNarrative + '\n\n' : ''}**${question}**\n${answer}`;
+    return { profileUpdates: {}, narrative: stubNarrative };
+  }
+
+  const system = [
+    'You maintain a leadership profile for a user of a coaching app, built up from their answers',
+    'to reflective questions over time. Given their existing profile, existing narrative, and one',
+    'new question/answer pair, respond with STRICT JSON only (no markdown fences, no commentary):',
+    '{',
+    '  "profileUpdates": { "firstName"?, "role"?, "industry"?, "currentChallenge"?, "goals"?: string[], "tonePref"?: "direct"|"empathetic", "brevityPref"?: "short"|"normal" },',
+    '  "narrative": string',
+    '}',
+    'Only include a field in profileUpdates if this specific answer gives real evidence for it — never guess or pad.',
+    'narrative is a 2-5 paragraph markdown document synthesizing who this person is as a leader: their',
+    'role, what they are working through, patterns across their answers, and how they are growing.',
+    'Rewrite it fresh each time incorporating the new answer — do not just append. Write it in third',
+    'person, grounded only in what they have actually said, never fabricated specifics.'
+  ].join('\n');
+
+  const userContent = [
+    `Existing profile: ${JSON.stringify(existingProfile || {})}`,
+    `Existing narrative:\n${existingNarrative || '(none yet)'}`,
+    `New question: ${question}`,
+    `Their answer: ${answer}`
+  ].join('\n\n');
+
+  try {
+    const res = await postChatWithRetry({
+      model: config.chat.model,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: userContent }
+      ],
+      temperature: 0.4,
+      max_tokens: 700
+    }, apiKey);
+    const raw = res.data?.choices?.[0]?.message?.content || '{}';
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+    const parsed = JSON.parse(cleaned);
+    return {
+      profileUpdates: parsed.profileUpdates || {},
+      narrative: parsed.narrative || existingNarrative || ''
+    };
+  } catch (err: any) {
+    logger.error({ err: err?.message }, 'Reflection extraction failed');
+    const fallbackNarrative = `${existingNarrative ? existingNarrative + '\n\n' : ''}**${question}**\n${answer}`;
+    return { profileUpdates: {}, narrative: fallbackNarrative };
+  }
+}
+
 function extractContextCitations(context: string): GeneratedCitation[] {
   const regex = /\[#(\d+)\s+score=/g;
   const out: GeneratedCitation[] = [];

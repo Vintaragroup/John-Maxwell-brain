@@ -141,6 +141,10 @@ function trimThread(t: ConversationThread, maxTokensApprox = 4000, maxMessages =
   }
 }
 
-export function listThreads(limit = 50) {
-  return Array.from(threads.values()).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit).map(t => ({ id: t.id, userId: t.userId, updatedAt: t.updatedAt }));
+export function listThreads(limit = 50, userId?: string) {
+  return Array.from(threads.values())
+    .filter(t => !userId || t.userId === userId)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, limit)
+    .map(t => ({ id: t.id, userId: t.userId, createdAt: t.createdAt, updatedAt: t.updatedAt, userTurnCount: t.userTurnCount }));
 }
