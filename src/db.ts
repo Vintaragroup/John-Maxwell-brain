@@ -76,11 +76,31 @@ db.exec(`
     createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
+  CREATE TABLE IF NOT EXISTS reflection_answers (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId       TEXT NOT NULL,
+    questionId   TEXT NOT NULL,
+    question     TEXT NOT NULL,
+    answer       TEXT NOT NULL,
+    extracted    TEXT,
+    createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
   CREATE INDEX IF NOT EXISTS idx_summaries_user ON coaching_summaries(userId, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_goals_user ON user_goals(userId, status);
   CREATE INDEX IF NOT EXISTS idx_analytics_type ON analytics_events(eventType, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_ratings_thread ON response_ratings(threadId);
+  CREATE INDEX IF NOT EXISTS idx_reflections_user ON reflection_answers(userId, createdAt DESC);
 `);
+
+// Lightweight migration: CREATE TABLE IF NOT EXISTS won't add columns to an
+// already-existing table, so add profileNarrative separately and ignore the
+// "duplicate column" error on repeat runs.
+try {
+  db.exec('ALTER TABLE user_profiles ADD COLUMN profileNarrative TEXT');
+} catch {
+  // already exists
+}
 
 export interface DbUserProfile {
   userId: string;
@@ -91,12 +111,13 @@ export interface DbUserProfile {
   goals?: string[];
   tonePref?: string;
   brevityPref?: string;
+  profileNarrative?: string;
 }
 
 export function upsertProfile(p: DbUserProfile): void {
   db.prepare(`
-    INSERT INTO user_profiles (userId, firstName, role, industry, currentChallenge, goals, tonePref, brevityPref, updatedAt)
-    VALUES (@userId, @firstName, @role, @industry, @currentChallenge, @goals, @tonePref, @brevityPref, unixepoch())
+    INSERT INTO user_profiles (userId, firstName, role, industry, currentChallenge, goals, tonePref, brevityPref, profileNarrative, updatedAt)
+    VALUES (@userId, @firstName, @role, @industry, @currentChallenge, @goals, @tonePref, @brevityPref, @profileNarrative, unixepoch())
     ON CONFLICT(userId) DO UPDATE SET
       firstName = COALESCE(@firstName, firstName),
       role = COALESCE(@role, role),
@@ -105,10 +126,12 @@ export function upsertProfile(p: DbUserProfile): void {
       goals = COALESCE(@goals, goals),
       tonePref = COALESCE(@tonePref, tonePref),
       brevityPref = COALESCE(@brevityPref, brevityPref),
+      profileNarrative = COALESCE(@profileNarrative, profileNarrative),
       updatedAt = unixepoch()
   `).run({
     ...p,
-    goals: p.goals ? JSON.stringify(p.goals) : null
+    goals: p.goals ? JSON.stringify(p.goals) : null,
+    profileNarrative: p.profileNarrative ?? null
   });
 }
 
@@ -119,6 +142,20 @@ export function getProfile(userId: string): DbUserProfile | undefined {
     ...row,
     goals: row.goals ? JSON.parse(row.goals) : undefined
   };
+}
+
+export function saveReflectionAnswer(userId: string, questionId: string, question: string, answer: string, extracted?: object): void {
+  db.prepare(`
+    INSERT INTO reflection_answers (userId, questionId, question, answer, extracted)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(userId, questionId, question, answer, extracted ? JSON.stringify(extracted) : null);
+}
+
+export function getReflectionAnswers(userId: string): Array<{ questionId: string; question: string; answer: string; createdAt: number }> {
+  return db.prepare(`
+    SELECT questionId, question, answer, createdAt FROM reflection_answers
+    WHERE userId = ? ORDER BY createdAt ASC
+  `).all(userId) as Array<{ questionId: string; question: string; answer: string; createdAt: number }>;
 }
 
 export function saveCoachingSummary(userId: string, threadId: string, summary: string, turnCount: number): void {

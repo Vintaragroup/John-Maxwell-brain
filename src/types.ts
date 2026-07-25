@@ -78,4 +78,5 @@ export interface UserProfile {
   stakeholders?: string[]; // key people
   deadlines?: Array<{ name: string; date: string }>; // ISO date strings preferred
   boundaries?: string[]; // topics to avoid, etc.
+  profileNarrative?: string; // markdown, synthesized from Insights reflection answers
 }

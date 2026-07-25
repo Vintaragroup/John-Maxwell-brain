@@ -11,7 +11,7 @@ import { indexChunks, search, searchDetailed, getIndexStats } from './retrieve';
 import { LRUCache, makeRetrievalKey } from './cache';
 import { buildPrompt } from './prompt';
 import { dedupStats } from './dedup';
-import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, ChatMessage } from './generate';
+import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage } from './generate';
 import { getMemory, upsertMemory, listMemories, recordFeedback, decayPreferences } from './memory';
 import { listConfigHistory, currentRuntimeConfig, updateRuntimeConfig } from './admin_config';
 import { createThread, addMessage, getThread, getHistory, listThreads, setThreadUser, setCoachingSummary, getCoachingSummary } from './conversation';
@@ -21,7 +21,7 @@ import { getRelevantPersonaSnippet } from './persona';
 import { UserProfile } from './types';
 import fs from 'fs';
 import { checkRateLimit, remainingTokens } from './rate_limit';
-import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, trackEvent, getAnalyticsSummary, saveRating } from './db';
+import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers } from './db';
 
 const app = express();
 // CORS for frontend apps
@@ -196,6 +196,55 @@ app.post('/profile', (req: Request, res: Response) => {
   profiles.set(p.userId, p);
   upsertProfile({ userId: p.userId, firstName: p.firstName, role: p.role, industry: p.industry, currentChallenge: p.currentChallenge, goals: p.goals, tonePref: p.tonePref, brevityPref: p.brevityPref });
   res.json({ ok: true, profile: p });
+});
+
+const ReflectSchema = z.object({
+  userId: z.string().min(1),
+  questionId: z.string().min(1),
+  question: z.string().min(1),
+  answer: z.string().min(1)
+});
+
+// Insights Q&A: interpret one answer, fold it into the user's structured profile
+// fields and their growing markdown narrative.
+app.post('/profile/reflect', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId, questionId, question, answer } = ReflectSchema.parse(req.body ?? {});
+    const existing: UserProfile = profiles.get(userId) || (getDbProfile(userId) as UserProfile | undefined) || { userId };
+    const result = await extractProfileReflection({
+      existingProfile: existing,
+      existingNarrative: existing.profileNarrative,
+      question,
+      answer
+    });
+    const updated: UserProfile = {
+      ...existing,
+      ...result.profileUpdates,
+      goals: result.profileUpdates.goals ?? existing.goals,
+      userId,
+      profileNarrative: result.narrative
+    };
+    profiles.set(userId, updated);
+    upsertProfile({
+      userId,
+      firstName: updated.firstName,
+      role: updated.role,
+      industry: updated.industry,
+      currentChallenge: updated.currentChallenge,
+      goals: updated.goals,
+      tonePref: updated.tonePref,
+      brevityPref: updated.brevityPref,
+      profileNarrative: updated.profileNarrative
+    });
+    saveReflectionAnswer(userId, questionId, question, answer, result.profileUpdates);
+    res.json({ ok: true, profileUpdates: result.profileUpdates, narrative: result.narrative, profile: updated });
+  } catch (err) { next(err); }
+});
+
+app.get('/profile/reflect', (req: Request, res: Response) => {
+  const userId = String((req.query.userId || '').toString() || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  res.json({ answers: getReflectionAnswers(userId) });
 });
 
 app.get('/goals', (req: Request, res: Response) => {
@@ -525,8 +574,15 @@ app.post('/conversation/start', (req: Request, res: Response) => {
   res.json({ id: t.id, openingMessage: opening.content });
 });
 
-app.get('/conversation', (_req: Request, res: Response) => {
-  res.json({ threads: listThreads() });
+app.get('/conversation', (req: Request, res: Response) => {
+  const userId = req.query.userId ? String(req.query.userId) : undefined;
+  res.json({ threads: listThreads(50, userId) });
+});
+
+app.get('/conversation/:id', (req: Request, res: Response) => {
+  const t = getThread(req.params.id);
+  if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  res.json({ thread: t });
 });
 
 app.post('/conversation/:id/send', async (req: Request, res: Response, next: NextFunction) => {
