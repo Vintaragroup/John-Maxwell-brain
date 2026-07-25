@@ -181,6 +181,14 @@ export function getSavedInsights(userId: string): Array<{ id: string; text: stri
   `).all(userId) as Array<{ id: string; text: string; createdAt: number }>;
 }
 
+export function deleteAllUserData(userId: string): void {
+  db.prepare('DELETE FROM user_profiles WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM coaching_summaries WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM user_goals WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM reflection_answers WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM saved_insights WHERE userId = ?').run(userId);
+}
+
 export function saveCoachingSummary(userId: string, threadId: string, summary: string, turnCount: number): void {
   db.prepare(`
     INSERT INTO coaching_summaries (userId, threadId, summary, turnCount)

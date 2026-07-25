@@ -14,14 +14,14 @@ import { dedupStats } from './dedup';
 import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage } from './generate';
 import { getMemory, upsertMemory, listMemories, recordFeedback, decayPreferences } from './memory';
 import { listConfigHistory, currentRuntimeConfig, updateRuntimeConfig } from './admin_config';
-import { createThread, addMessage, getThread, getHistory, listThreads, setThreadUser, setCoachingSummary, getCoachingSummary } from './conversation';
+import { createThread, addMessage, getThread, getHistory, listThreads, setThreadUser, setCoachingSummary, getCoachingSummary, deleteThreadsForUser } from './conversation';
 import { synthesizeSpeech } from './voice';
 import { getDateTime, getWeather } from './context';
 import { getRelevantPersonaSnippet } from './persona';
 import { UserProfile } from './types';
 import fs from 'fs';
 import { checkRateLimit, remainingTokens } from './rate_limit';
-import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers, saveInsight, deleteInsight, getSavedInsights } from './db';
+import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers, saveInsight, deleteInsight, getSavedInsights, deleteAllUserData } from './db';
 
 const app = express();
 // CORS for frontend apps
@@ -308,6 +308,17 @@ app.delete('/insights/:id', (req: Request, res: Response) => {
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
   deleteInsight(userId, req.params.id);
   res.json({ ok: true });
+});
+
+// Wipes everything Brain knows about a user: profile, goals, reflections,
+// saved insights, and every conversation thread. Irreversible.
+app.delete('/user-data', (req: Request, res: Response) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  profiles.delete(userId);
+  deleteAllUserData(userId);
+  const threadsDeleted = deleteThreadsForUser(userId);
+  res.json({ ok: true, threadsDeleted });
 });
 
 app.get('/admin/analytics', (_req: Request, res: Response) => {

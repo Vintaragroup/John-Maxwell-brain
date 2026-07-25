@@ -141,6 +141,21 @@ function trimThread(t: ConversationThread, maxTokensApprox = 4000, maxMessages =
   }
 }
 
+export function deleteThreadsForUser(userId: string): number {
+  let count = 0;
+  for (const [id, t] of threads) {
+    if (t.userId === userId) {
+      threads.delete(id);
+      count++;
+    }
+  }
+  if (count > 0) {
+    dirty = true;
+    scheduleSave();
+  }
+  return count;
+}
+
 export function listThreads(limit = 50, userId?: string) {
   return Array.from(threads.values())
     .filter(t => !userId || t.userId === userId)
