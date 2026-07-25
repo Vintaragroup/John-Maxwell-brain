@@ -21,7 +21,7 @@ import { getRelevantPersonaSnippet } from './persona';
 import { UserProfile } from './types';
 import fs from 'fs';
 import { checkRateLimit, remainingTokens } from './rate_limit';
-import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers } from './db';
+import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers, saveInsight, deleteInsight, getSavedInsights } from './db';
 
 const app = express();
 // CORS for frontend apps
@@ -278,6 +278,35 @@ app.patch('/goals/:id', (req: Request, res: Response) => {
   const { status } = req.body || {};
   if (!['active', 'achieved', 'paused'].includes(status)) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } });
   updateGoalStatus(id, status);
+  res.json({ ok: true });
+});
+
+app.get('/insights', (req: Request, res: Response) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  res.json({ insights: getSavedInsights(userId) });
+});
+
+const SaveInsightSchema = z.object({
+  userId: z.string().min(1),
+  id: z.string().min(1),
+  text: z.string().min(1)
+});
+
+app.post('/insights', (req: Request, res: Response) => {
+  try {
+    const { userId, id, text } = SaveInsightSchema.parse(req.body ?? {});
+    saveInsight(userId, id, text);
+    res.json({ ok: true });
+  } catch (_err) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid insight data' } });
+  }
+});
+
+app.delete('/insights/:id', (req: Request, res: Response) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  deleteInsight(userId, req.params.id);
   res.json({ ok: true });
 });
 

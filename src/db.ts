@@ -86,10 +86,18 @@ db.exec(`
     createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
+  CREATE TABLE IF NOT EXISTS saved_insights (
+    id           TEXT PRIMARY KEY,
+    userId       TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
   CREATE INDEX IF NOT EXISTS idx_summaries_user ON coaching_summaries(userId, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_goals_user ON user_goals(userId, status);
   CREATE INDEX IF NOT EXISTS idx_analytics_type ON analytics_events(eventType, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_ratings_thread ON response_ratings(threadId);
+  CREATE INDEX IF NOT EXISTS idx_saved_insights_user ON saved_insights(userId, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_reflections_user ON reflection_answers(userId, createdAt DESC);
 `);
 
@@ -156,6 +164,21 @@ export function getReflectionAnswers(userId: string): Array<{ questionId: string
     SELECT questionId, question, answer, createdAt FROM reflection_answers
     WHERE userId = ? ORDER BY createdAt ASC
   `).all(userId) as Array<{ questionId: string; question: string; answer: string; createdAt: number }>;
+}
+
+export function saveInsight(userId: string, id: string, text: string): void {
+  db.prepare(`INSERT OR REPLACE INTO saved_insights (id, userId, text) VALUES (?, ?, ?)`).run(id, userId, text);
+}
+
+export function deleteInsight(userId: string, id: string): void {
+  db.prepare(`DELETE FROM saved_insights WHERE id = ? AND userId = ?`).run(id, userId);
+}
+
+export function getSavedInsights(userId: string): Array<{ id: string; text: string; createdAt: number }> {
+  return db.prepare(`
+    SELECT id, text, createdAt FROM saved_insights
+    WHERE userId = ? ORDER BY createdAt DESC
+  `).all(userId) as Array<{ id: string; text: string; createdAt: number }>;
 }
 
 export function saveCoachingSummary(userId: string, threadId: string, summary: string, turnCount: number): void {
