@@ -21,7 +21,7 @@ import { getRelevantPersonaSnippet } from './persona';
 import { UserProfile } from './types';
 import fs from 'fs';
 import { checkRateLimit, remainingTokens } from './rate_limit';
-import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers } from './db';
+import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers } from './db';
 
 const app = express();
 // CORS for frontend apps
@@ -147,8 +147,11 @@ function normalizeProfile(input: any, fallbackUserId?: string): UserProfile | un
   };
 }
 
-function buildOpeningMessage(profile?: UserProfile, recentSummaries?: string[]): string {
+function buildOpeningMessage(profile?: UserProfile, recentSummaries?: string[], goalToCheckIn?: { title: string }): string {
   const isReturning = recentSummaries && recentSummaries.length > 0;
+  if (goalToCheckIn && profile?.firstName) {
+    return `${profile.firstName}, welcome back. Last time, you set a goal: "${goalToCheckIn.title}." How's that going?`;
+  }
   if (isReturning && profile?.firstName) {
     return `Welcome back, ${profile.firstName}. Last time we talked, ${recentSummaries[0]} I've been thinking about that. Where are you now with it?`;
   }
@@ -301,8 +304,32 @@ app.post('/rate', (req: Request, res: Response) => {
 });
 
 // Helper: build prompt with personal touch and dynamic context
-async function buildPersonalizedPrompt(query: string, results: Array<{ chunk: any; score: number }>, userId?: string, threadId?: string) {
-  const prompt = buildPrompt(query, results);
+// Lightweight, zero-cost keyword pass — not a real classifier, just a reliable
+// floor so the system prompt's empathy branch fires on clear distress signals
+// instead of depending entirely on the model inferring tone from context.
+const DISTRESS_PATTERNS: Array<{ pattern: RegExp; signal: string }> = [
+  { pattern: /\bburn(?:ed|t)?[\s-]?out\b/i, signal: 'feeling burned out' },
+  { pattern: /\boverwhelm(?:ed|ing)?\b/i, signal: 'feeling overwhelmed' },
+  { pattern: /\b(?:can'?t (?:do|handle|take) (?:this|it) anymore|giving up|about to give up)\b/i, signal: 'considering giving up' },
+  { pattern: /\b(?:i(?:'m| am) a failure|i failed|failing (?:as|at))\b/i, signal: 'feeling like a failure' },
+  { pattern: /\b(?:hopeless|pointless|no point (?:in|to))\b/i, signal: 'feeling hopeless' },
+  { pattern: /\b(?:scared|afraid|terrified|anxious|anxiety)\b/i, signal: 'feeling anxious or afraid' },
+  { pattern: /\bstress(?:ed)?(?: out)?\b/i, signal: 'feeling stressed' },
+  { pattern: /\b(?:exhausted|drained|depleted)\b/i, signal: 'feeling exhausted' },
+  { pattern: /\b(?:alone|isolated|no one (?:understands|gets it))\b/i, signal: 'feeling alone or unsupported' },
+  { pattern: /\b(?:so (?:angry|mad|furious)|frustrat(?:ed|ing))\b/i, signal: 'feeling frustrated or angry' }
+];
+
+function detectEmotionalSignal(text: string): string | undefined {
+  for (const { pattern, signal } of DISTRESS_PATTERNS) {
+    if (pattern.test(text)) return signal;
+  }
+  return undefined;
+}
+
+async function buildPersonalizedPrompt(query: string, results: Array<{ chunk: any; score: number }>, userId?: string, threadId?: string, opts: { isFirstMessage?: boolean } = {}) {
+  const emotionalSignal = detectEmotionalSignal(query);
+  const prompt = buildPrompt(query, results, { isFirstMessage: opts.isFirstMessage, emotionalSignal });
   let nameFrag = '';
   let contextFrag = '';
   let personaFrag = '';
@@ -566,9 +593,11 @@ app.post('/conversation/start', (req: Request, res: Response) => {
   if (dbProfile && resolvedUserId && !cachedProfile) profiles.set(resolvedUserId, { ...dbProfile } as UserProfile);
   const openingProfile = normalizedProfile || cachedProfile || (dbProfile ? ({ ...dbProfile } as UserProfile) : undefined);
   const recentSummaries = resolvedUserId ? getRecentCoachingSummaries(resolvedUserId, 1).map(s => s.summary) : [];
+  const goalToCheckIn = resolvedUserId && needsGoalCheckIn(resolvedUserId) ? getActiveGoals(resolvedUserId)[0] : undefined;
+  if (goalToCheckIn && resolvedUserId) markGoalChecked(resolvedUserId);
   const opening: ChatMessage = {
     role: 'assistant',
-    content: buildOpeningMessage(openingProfile, recentSummaries)
+    content: buildOpeningMessage(openingProfile, recentSummaries, goalToCheckIn)
   };
   const t = createThread(resolvedUserId, [opening, ...initial]);
   res.json({ id: t.id, openingMessage: opening.content });
@@ -605,6 +634,7 @@ app.post('/conversation/:id/send', async (req: Request, res: Response, next: Nex
         profiles.set(newUserId, { userId: newUserId, firstName });
       }
     }
+    const isFirstUserMessage = t.userTurnCount === 0;
     addMessage(id, { role: 'user', content: userText });
     let results: Array<{ chunk: any; score: number }> = [];
     if (config.content.retrievalEnabled) {
@@ -614,7 +644,7 @@ app.post('/conversation/:id/send', async (req: Request, res: Response, next: Nex
       const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
       results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
     }
-  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id);
+  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id, { isFirstMessage: isFirstUserMessage });
     const history = getHistory(id);
   const gen = await generateChatAnswer(prompt, history, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty });
     const updatedThread = addMessage(id, { role: 'assistant', content: gen.answer });
@@ -655,6 +685,7 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
         profiles.set(newUserId, { userId: newUserId, firstName });
       }
     }
+    const isFirstUserMessage = t.userTurnCount === 0;
     addMessage(id, { role: 'user', content: userText });
     let results: Array<{ chunk: any; score: number }> = [];
     if (config.content.retrievalEnabled) {
@@ -664,7 +695,7 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
       const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
       results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
     }
-  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id);
+  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id, { isFirstMessage: isFirstUserMessage });
     const history = getHistory(id);
     // SSE setup
     res.setHeader('Content-Type', 'text/event-stream');
