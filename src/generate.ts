@@ -69,7 +69,7 @@ export async function generateAnswer(prompt: PromptParts, opts: GenerateOptions 
       prompt.context,
       'User Query:',
       prompt.user,
-  'Instructions: Respond as John C. Maxwell in first person, be concise and practical, and cite chunk numbers inline like [#1], [#2] when you use the context. End with one short reflective question.'
+  'Instructions: Respond as John C. Maxwell in first person. Match the weight of your reply to what they actually said — casual messages get short, natural replies with no forced question; real coaching moments get real depth. Cite chunk numbers inline like [#1], [#2] only when you actually use the context.'
     ].join('\n\n');
     const res = await postChatWithRetry({
       model,
@@ -84,7 +84,9 @@ export async function generateAnswer(prompt: PromptParts, opts: GenerateOptions 
       frequency_penalty: opts.frequencyPenalty ?? 0.2
     }, apiKey);
   const answer = res.data?.choices?.[0]?.message?.content || 'No answer produced.';
-  const citations = mergeCitationSources(extractContextCitations(prompt.context), extractAnswerInlineCitations(answer));
+  const citations = isSubstantiveAnswer(answer)
+    ? mergeCitationSources(extractContextCitations(prompt.context), extractAnswerInlineCitations(answer))
+    : [];
   return { answer, citations, model };
   } catch (err: any) {
     const s = sanitizeAxiosError(err as AxiosError);
@@ -119,7 +121,7 @@ export async function generateChatAnswer(prompt: PromptParts, history: ChatMessa
     prompt.context,
     'User Query:',
     prompt.user,
-  'Instructions: Respond as John C. Maxwell in first person. Be concise and practical, cite chunk numbers inline like [#1], [#2] when you use the context, and end with one short reflective question.'
+  'Instructions: Respond as John C. Maxwell in first person. Match the weight of your reply to what they actually said — casual messages get short, natural replies with no forced question; real coaching moments get real depth. Cite chunk numbers inline like [#1], [#2] only when you actually use the context.'
   ].join('\n\n');
   // Filter out any system messages from provided history; we provide our own system prompt
   const prior = history.filter(m => m.role === 'user' || m.role === 'assistant');
@@ -138,7 +140,9 @@ export async function generateChatAnswer(prompt: PromptParts, history: ChatMessa
       frequency_penalty: opts.frequencyPenalty ?? 0.2
     }, apiKey);
     const answer = res.data?.choices?.[0]?.message?.content || 'No answer produced.';
-    const citations = mergeCitationSources(extractContextCitations(prompt.context), extractAnswerInlineCitations(answer));
+    const citations = isSubstantiveAnswer(answer)
+      ? mergeCitationSources(extractContextCitations(prompt.context), extractAnswerInlineCitations(answer))
+      : [];
     return { answer, citations, model };
   } catch (err: any) {
     const s = sanitizeAxiosError(err as AxiosError);
@@ -242,6 +246,13 @@ export async function extractProfileReflection(input: {
     const fallbackNarrative = `${existingNarrative ? existingNarrative + '\n\n' : ''}**${question}**\n${answer}`;
     return { profileUpdates: {}, narrative: fallbackNarrative };
   }
+}
+
+// A casual, short reply ("Good afternoon! How's your day going?") shouldn't carry
+// a "grounded in N of his talks" citation badge — retrieval always runs regardless
+// of whether the answer actually drew on it, so gate citations on answer substance.
+function isSubstantiveAnswer(answer: string): boolean {
+  return answer.trim().split(/\s+/).filter(Boolean).length >= 20;
 }
 
 function extractContextCitations(context: string): GeneratedCitation[] {
