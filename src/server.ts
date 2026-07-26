@@ -21,7 +21,7 @@ import { getRelevantPersonaSnippet } from './persona';
 import { UserProfile } from './types';
 import fs from 'fs';
 import { checkRateLimit, remainingTokens } from './rate_limit';
-import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers, saveInsight, deleteInsight, getSavedInsights, deleteAllUserData } from './db';
+import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers, saveInsight, deleteInsight, getSavedInsights, deleteAllUserData, registerDeviceToken, hasDeviceToken, isValidUserToken, getGoalOwner } from './db';
 
 const app = express();
 // CORS for frontend apps
@@ -116,6 +116,30 @@ app.get('/corpus/stats', (_req: Request, res: Response) => {
 // --- Simple in-memory user profiles ---
 const profiles = new Map<string, UserProfile>();
 
+// Verifies the caller owns `userId` before letting a request touch their data.
+// A userId with no registered token yet is "unclaimed" and passes through —
+// this is what lets a client's freshly-generated userId work on its very
+// first request, before /device/register has necessarily been called for it.
+// Once a token IS registered for a userId, only a matching x-user-token can
+// act as that user. Sends the 401 response itself when verification fails.
+function verifyUserToken(req: Request, res: Response, userId: string | undefined): boolean {
+  if (!userId) return true;
+  if (!hasDeviceToken(userId)) return true;
+  const token = req.headers['x-user-token'] as string | undefined;
+  if (!token || !isValidUserToken(userId, token)) {
+    res.status(401).json({ error: { code: 'INVALID_USER_TOKEN', message: 'Missing or invalid user token for this userId' } });
+    return false;
+  }
+  return true;
+}
+
+app.post('/device/register', (req: Request, res: Response) => {
+  const userId = String(req.body?.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  const token = registerDeviceToken(userId);
+  res.json({ token });
+});
+
 function normalizeProfile(input: any, fallbackUserId?: string): UserProfile | undefined {
   const resolvedUserId = input?.userId ? String(input.userId) : fallbackUserId;
   if (!resolvedUserId) return undefined;
@@ -185,6 +209,7 @@ function maybeRefreshCoachingSummary(id: string, userTurnCount: number): void {
 app.get('/profile', (req: Request, res: Response) => {
   const userId = String((req.query.userId || '').toString() || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   const memProfile = profiles.get(userId);
   const dbProfile = !memProfile ? getDbProfile(userId) : undefined;
   if (dbProfile && !memProfile) profiles.set(userId, { ...dbProfile } as UserProfile);
@@ -194,6 +219,7 @@ app.get('/profile', (req: Request, res: Response) => {
 app.post('/profile', (req: Request, res: Response) => {
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, String(userId))) return;
   const p = normalizeProfile(req.body, String(userId));
   if (!p) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
   profiles.set(p.userId, p);
@@ -213,6 +239,7 @@ const ReflectSchema = z.object({
 app.post('/profile/reflect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId, questionId, question, answer } = ReflectSchema.parse(req.body ?? {});
+    if (!verifyUserToken(req, res, userId)) return;
     const existing: UserProfile = profiles.get(userId) || (getDbProfile(userId) as UserProfile | undefined) || { userId };
     const result = await extractProfileReflection({
       existingProfile: existing,
@@ -247,12 +274,14 @@ app.post('/profile/reflect', async (req: Request, res: Response, next: NextFunct
 app.get('/profile/reflect', (req: Request, res: Response) => {
   const userId = String((req.query.userId || '').toString() || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   res.json({ answers: getReflectionAnswers(userId) });
 });
 
 app.get('/goals', (req: Request, res: Response) => {
   const userId = String(req.query.userId || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   res.json({ goals: getActiveGoals(userId) });
 });
 
@@ -266,6 +295,7 @@ const GoalSchema = z.object({
 app.post('/goals', (req: Request, res: Response) => {
   try {
     const { userId, title, description, targetDate } = GoalSchema.parse(req.body ?? {});
+    if (!verifyUserToken(req, res, userId)) return;
     const id = addGoal({ userId, title, description, targetDate });
     res.json({ ok: true, id });
   } catch (_err) {
@@ -277,6 +307,8 @@ app.patch('/goals/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
   const { status } = req.body || {};
   if (!['active', 'achieved', 'paused'].includes(status)) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } });
+  const owner = getGoalOwner(id);
+  if (!verifyUserToken(req, res, owner)) return;
   updateGoalStatus(id, status);
   res.json({ ok: true });
 });
@@ -284,6 +316,7 @@ app.patch('/goals/:id', (req: Request, res: Response) => {
 app.get('/insights', (req: Request, res: Response) => {
   const userId = String(req.query.userId || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   res.json({ insights: getSavedInsights(userId) });
 });
 
@@ -296,6 +329,7 @@ const SaveInsightSchema = z.object({
 app.post('/insights', (req: Request, res: Response) => {
   try {
     const { userId, id, text } = SaveInsightSchema.parse(req.body ?? {});
+    if (!verifyUserToken(req, res, userId)) return;
     saveInsight(userId, id, text);
     res.json({ ok: true });
   } catch (_err) {
@@ -306,6 +340,7 @@ app.post('/insights', (req: Request, res: Response) => {
 app.delete('/insights/:id', (req: Request, res: Response) => {
   const userId = String(req.query.userId || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   deleteInsight(userId, req.params.id);
   res.json({ ok: true });
 });
@@ -315,6 +350,7 @@ app.delete('/insights/:id', (req: Request, res: Response) => {
 app.delete('/user-data', (req: Request, res: Response) => {
   const userId = String(req.query.userId || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   profiles.delete(userId);
   deleteAllUserData(userId);
   const threadsDeleted = deleteThreadsForUser(userId);
@@ -625,6 +661,7 @@ app.post('/conversation/start', (req: Request, res: Response) => {
   const resolvedUserId = userId ? String(userId)
     : (profile?.userId ? String(profile.userId)
     : (profile ? 'u_' + Math.random().toString(36).slice(2, 10) : undefined));
+  if (!verifyUserToken(req, res, resolvedUserId)) return;
   const initial = Array.isArray(seed) ? seed : [];
   const normalizedProfile = normalizeProfile(profile, resolvedUserId);
   if (normalizedProfile) profiles.set(normalizedProfile.userId, normalizedProfile);
@@ -645,12 +682,14 @@ app.post('/conversation/start', (req: Request, res: Response) => {
 
 app.get('/conversation', (req: Request, res: Response) => {
   const userId = req.query.userId ? String(req.query.userId) : undefined;
+  if (!verifyUserToken(req, res, userId)) return;
   res.json({ threads: listThreads(50, userId) });
 });
 
 app.get('/conversation/:id', (req: Request, res: Response) => {
   const t = getThread(req.params.id);
   if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  if (!verifyUserToken(req, res, t.userId)) return;
   res.json({ thread: t });
 });
 
@@ -661,6 +700,7 @@ app.post('/conversation/:id/send', async (req: Request, res: Response, next: Nex
     if (!query) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing query' } });
     const t = getThread(id);
     if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+    if (!verifyUserToken(req, res, t.userId)) return;
     // If this is the first user response and we don't have a userId yet, try to capture first name.
     const userText = String(query);
     // Very light name extraction: first token up to punctuation, alphabetic only
@@ -715,6 +755,7 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
     if (!query) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing query' } });
     const t = getThread(id);
     if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+    if (!verifyUserToken(req, res, t.userId)) return;
     const userText = String(query);
     if (!t.userId) {
       const m = userText.match(/^(?:hi|hello|hey|it'?s|i am|i'm|my name is|name's)?\s*([A-Za-z\-']{2,})(?:[\s,!.?]|$)/i);

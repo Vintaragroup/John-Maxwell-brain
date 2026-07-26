@@ -6,6 +6,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 
 const DB_PATH = process.env.DB_PATH || path.resolve('.cache/maxwell.db');
 
@@ -90,6 +91,12 @@ db.exec(`
     id           TEXT PRIMARY KEY,
     userId       TEXT NOT NULL,
     text         TEXT NOT NULL,
+    createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
+  CREATE TABLE IF NOT EXISTS device_tokens (
+    userId       TEXT PRIMARY KEY,
+    token        TEXT NOT NULL,
     createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
@@ -187,6 +194,34 @@ export function deleteAllUserData(userId: string): void {
   db.prepare('DELETE FROM user_goals WHERE userId = ?').run(userId);
   db.prepare('DELETE FROM reflection_answers WHERE userId = ?').run(userId);
   db.prepare('DELETE FROM saved_insights WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM device_tokens WHERE userId = ?').run(userId);
+}
+
+// Lightweight per-user auth: not a login system, just a private bearer token
+// tied to a userId so that knowing/guessing a userId alone (previously the
+// only thing standing between any client and that user's data, since every
+// client shares one API key) is no longer enough. First registration for a
+// userId wins and is permanent; there's no re-issue/rotate flow.
+export function registerDeviceToken(userId: string): string {
+  const existing = db.prepare('SELECT token FROM device_tokens WHERE userId = ?').get(userId) as { token: string } | undefined;
+  if (existing) return existing.token;
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('INSERT INTO device_tokens (userId, token) VALUES (?, ?)').run(userId, token);
+  return token;
+}
+
+export function hasDeviceToken(userId: string): boolean {
+  return !!db.prepare('SELECT 1 FROM device_tokens WHERE userId = ?').get(userId);
+}
+
+export function isValidUserToken(userId: string, token: string): boolean {
+  const row = db.prepare('SELECT token FROM device_tokens WHERE userId = ?').get(userId) as { token: string } | undefined;
+  return !!row && row.token === token;
+}
+
+export function getGoalOwner(id: number): string | undefined {
+  const row = db.prepare('SELECT userId FROM user_goals WHERE id = ?').get(id) as { userId: string } | undefined;
+  return row?.userId;
 }
 
 export function saveCoachingSummary(userId: string, threadId: string, summary: string, turnCount: number): void {
