@@ -9,7 +9,7 @@ import { fetchWebPage, ingestText, ingestPdf, ingestTranscript } from './ingest'
 import { toChunks } from './parse';
 import { indexChunks, search, searchDetailed, getIndexStats } from './retrieve';
 import { LRUCache, makeRetrievalKey } from './cache';
-import { buildPrompt } from './prompt';
+import { buildPrompt, isLikelyLowWeightMessage } from './prompt';
 import { dedupStats } from './dedup';
 import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage } from './generate';
 import { getMemory, upsertMemory, listMemories, recordFeedback, decayPreferences } from './memory';
@@ -171,21 +171,29 @@ function normalizeProfile(input: any, fallbackUserId?: string): UserProfile | un
   };
 }
 
+function omitUndefined<T extends object>(obj: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const key of Object.keys(obj) as (keyof T)[]) {
+    if (obj[key] !== undefined) out[key] = obj[key];
+  }
+  return out;
+}
+
 function buildOpeningMessage(profile?: UserProfile, recentSummaries?: string[], goalToCheckIn?: { title: string }): string {
   const isReturning = recentSummaries && recentSummaries.length > 0;
   if (goalToCheckIn && profile?.firstName) {
-    return `${profile.firstName}, welcome back. Last time, you set a goal: "${goalToCheckIn.title}." How's that going?`;
+    return `Good to see you again, ${profile.firstName}. How's it going with "${goalToCheckIn.title}"?`;
   }
   if (isReturning && profile?.firstName) {
-    return `Welcome back, ${profile.firstName}. Last time we talked, ${recentSummaries[0]} I've been thinking about that. Where are you now with it?`;
+    return `Welcome back, ${profile.firstName}. ${recentSummaries[0]} How are things now?`;
   }
   if (profile?.firstName && profile.currentChallenge) {
-    return `${profile.firstName}, welcome. I've been thinking about leaders who face ${profile.currentChallenge}. Let me ask you — what would it mean to you personally if you made a real breakthrough there?`;
+    return `Hey ${profile.firstName}, good to see you. How have things been with ${profile.currentChallenge}?`;
   }
   if (profile?.firstName) {
-    return `${profile.firstName}, I'm glad you're here. I'm John Maxwell. Before we dive in — what's the one area of your leadership you most want to grow in right now?`;
+    return `${profile.firstName}, glad you're here. What's on your mind today?`;
   }
-  return "I'm glad you're here. I'm John Maxwell — I've spent over 50 years studying and teaching leadership. Before we dive in, I want to make this personal. What's your first name?";
+  return "Good to have you here. I'm John Maxwell — I've spent over 50 years studying and teaching leadership. What should I call you?";
 }
 
 function maybeRefreshCoachingSummary(id: string, userTurnCount: number): void {
@@ -402,6 +410,7 @@ function detectEmotionalSignal(text: string): string | undefined {
   }
   return undefined;
 }
+
 
 async function buildPersonalizedPrompt(query: string, results: Array<{ chunk: any; score: number }>, userId?: string, threadId?: string, opts: { isFirstMessage?: boolean } = {}) {
   const emotionalSignal = detectEmotionalSignal(query);
@@ -663,12 +672,19 @@ app.post('/conversation/start', (req: Request, res: Response) => {
     : (profile ? 'u_' + Math.random().toString(36).slice(2, 10) : undefined));
   if (!verifyUserToken(req, res, resolvedUserId)) return;
   const initial = Array.isArray(seed) ? seed : [];
+  const existingProfile = resolvedUserId
+    ? (profiles.get(resolvedUserId) || (getDbProfile(resolvedUserId) as UserProfile | undefined))
+    : undefined;
+  // Merge rather than replace: normalizeProfile() always returns a truthy object
+  // once a userId resolves, even when the caller passed no profile fields at all
+  // (every field just comes back undefined). Blindly overwriting the cache with
+  // that would wipe already-known fields like currentChallenge whenever a client
+  // starts a conversation before its local profile state has hydrated.
   const normalizedProfile = normalizeProfile(profile, resolvedUserId);
-  if (normalizedProfile) profiles.set(normalizedProfile.userId, normalizedProfile);
-  const cachedProfile = resolvedUserId ? profiles.get(resolvedUserId) : undefined;
-  const dbProfile = !normalizedProfile && resolvedUserId && !cachedProfile ? getDbProfile(resolvedUserId) : undefined;
-  if (dbProfile && resolvedUserId && !cachedProfile) profiles.set(resolvedUserId, { ...dbProfile } as UserProfile);
-  const openingProfile = normalizedProfile || cachedProfile || (dbProfile ? ({ ...dbProfile } as UserProfile) : undefined);
+  const openingProfile = normalizedProfile
+    ? ({ ...(existingProfile || {}), ...omitUndefined(normalizedProfile) } as UserProfile)
+    : existingProfile;
+  if (openingProfile && resolvedUserId) profiles.set(resolvedUserId, openingProfile);
   const recentSummaries = resolvedUserId ? getRecentCoachingSummaries(resolvedUserId, 1).map(s => s.summary) : [];
   const goalToCheckIn = resolvedUserId && needsGoalCheckIn(resolvedUserId) ? getActiveGoals(resolvedUserId)[0] : undefined;
   if (goalToCheckIn && resolvedUserId) markGoalChecked(resolvedUserId);
@@ -726,7 +742,8 @@ app.post('/conversation/:id/send', async (req: Request, res: Response, next: Nex
     }
   const prompt = await buildPersonalizedPrompt(query, results, t.userId, id, { isFirstMessage: isFirstUserMessage });
     const history = getHistory(id);
-  const gen = await generateChatAnswer(prompt, history, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty });
+  const effectiveMaxTokens = maxTokens ?? (isLikelyLowWeightMessage(userText) ? 70 : undefined);
+  const gen = await generateChatAnswer(prompt, history, { temperature, maxTokens: effectiveMaxTokens, topP, presencePenalty, frequencyPenalty });
     const updatedThread = addMessage(id, { role: 'assistant', content: gen.answer });
     trackEvent({ eventType: 'query', userId: t.userId, model: gen.model, chunkIds: results.map(r => r.chunk.id), isStub: gen.model === 'stub-local' });
     maybeRefreshCoachingSummary(id, updatedThread?.userTurnCount ?? t.userTurnCount);
@@ -787,7 +804,8 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
     req.on('close', () => controller.abort());
     const resultsMap = new Map<number, (typeof results)[number]>();
     results.forEach((r: any, idx: number) => resultsMap.set(idx + 1, r));
-  for await (const chunk of streamChatAnswer(prompt, history, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty })) {
+  const effectiveMaxTokens = maxTokens ?? (isLikelyLowWeightMessage(userText) ? 70 : undefined);
+  for await (const chunk of streamChatAnswer(prompt, history, { temperature, maxTokens: effectiveMaxTokens, topP, presencePenalty, frequencyPenalty })) {
       if (controller.signal.aborted) break;
       if (chunk.type === 'start') {
         const citations = (chunk.citations || []).map((c: any) => {

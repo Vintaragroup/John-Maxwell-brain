@@ -1,7 +1,7 @@
 import axios, { AxiosError } from 'axios';
 import { config } from './config';
 import { logger } from './logger';
-import { PromptParts } from './prompt';
+import { PromptParts, isLikelyLowWeightMessage } from './prompt';
 
 export interface GenerateOptions {
   temperature?: number;
@@ -84,7 +84,7 @@ export async function generateAnswer(prompt: PromptParts, opts: GenerateOptions 
       frequency_penalty: opts.frequencyPenalty ?? 0.2
     }, apiKey);
   const answer = res.data?.choices?.[0]?.message?.content || 'No answer produced.';
-  const citations = isSubstantiveAnswer(answer)
+  const citations = !isLikelyLowWeightMessage(prompt.user) && isSubstantiveAnswer(answer)
     ? mergeCitationSources(extractContextCitations(prompt.context), extractAnswerInlineCitations(answer))
     : [];
   return { answer, citations, model };
@@ -140,7 +140,7 @@ export async function generateChatAnswer(prompt: PromptParts, history: ChatMessa
       frequency_penalty: opts.frequencyPenalty ?? 0.2
     }, apiKey);
     const answer = res.data?.choices?.[0]?.message?.content || 'No answer produced.';
-    const citations = isSubstantiveAnswer(answer)
+    const citations = !isLikelyLowWeightMessage(prompt.user) && isSubstantiveAnswer(answer)
       ? mergeCitationSources(extractContextCitations(prompt.context), extractAnswerInlineCitations(answer))
       : [];
     return { answer, citations, model };
