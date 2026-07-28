@@ -14,6 +14,8 @@ services:
         value: qdrant
       - key: QDRANT_URL
         sync: false  # set manually — point to Qdrant Cloud
+      - key: QDRANT_API_KEY
+        sync: false  # set manually — Qdrant Cloud requires this (local Qdrant didn't)
       - key: OPENAI_API_KEY
         sync: false  # set manually in dashboard
       - key: EMBEDDING_PROVIDER
@@ -22,3 +24,13 @@ services:
         sync: false
       - key: API_KEYS
         sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false  # set manually — omit to leave voice unconfigured
+      - key: ELEVENLABS_VOICE_ID
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false  # set manually once the frontend's deployed URL is known
+      - key: PERSONA_PATH
+        value: ./data/persona/john_persona_curated.md
+      - key: PERSONA_SNIPPETS_ENABLED
+        value: true
