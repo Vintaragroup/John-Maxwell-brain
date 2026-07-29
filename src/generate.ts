@@ -27,6 +27,10 @@ export interface StreamChunk {
   data?: string;
   citations?: GeneratedCitation[];
   model?: string;
+  // Included on 'done' — the exact complete text that was streamed, so
+  // callers can persist/cache it without an extra (and non-deterministic,
+  // since sampling has real randomness) second generation call.
+  answer?: string;
 }
 
 export interface ChatMessage {
@@ -45,7 +49,7 @@ export async function *streamAnswer(prompt: PromptParts, opts: GenerateOptions =
       if (!t) continue;
       yield { type: 'token', data: t };
     }
-    yield { type: 'done' };
+    yield { type: 'done', answer: full.answer, citations: full.citations, model: full.model };
   } catch (err: any) {
     yield { type: 'error', data: err?.message || 'stream_failed' };
   }
@@ -164,7 +168,7 @@ export async function *streamChatAnswer(prompt: PromptParts, history: ChatMessag
     for (const t of full.answer.split(/(\s+)/).filter(Boolean)) {
       yield { type: 'token', data: t };
     }
-    yield { type: 'done' };
+    yield { type: 'done', answer: full.answer, citations: full.citations, model: full.model };
   } catch (err: any) {
     yield { type: 'error', data: err?.message || 'stream_failed' };
   }

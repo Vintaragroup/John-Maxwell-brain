@@ -11,7 +11,7 @@ import { indexChunks, search, searchDetailed, getIndexStats } from './retrieve';
 import { LRUCache, makeRetrievalKey } from './cache';
 import { buildPrompt, isLikelyLowWeightMessage } from './prompt';
 import { dedupStats } from './dedup';
-import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage } from './generate';
+import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage, GeneratedAnswer } from './generate';
 import { getMemory, upsertMemory, listMemories, recordFeedback, decayPreferences } from './memory';
 import { listConfigHistory, currentRuntimeConfig, updateRuntimeConfig } from './admin_config';
 import { createThread, addMessage, getThread, getHistory, listThreads, setThreadUser, setCoachingSummary, getCoachingSummary, deleteThreadsForUser } from './conversation';
@@ -621,6 +621,7 @@ app.post('/generate/stream', async (req: Request, res: Response, next: NextFunct
       return;
     }
   const stream = history && history.length ? streamChatAnswer(prompt, history as ChatMessage[], { temperature, maxTokens, topP, presencePenalty, frequencyPenalty }) : streamAnswer(prompt, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty });
+    let finalGen: GeneratedAnswer | null = null;
     for await (const chunk of stream) {
       if (controller.signal.aborted) break;
       if (chunk.type === 'start') {
@@ -642,6 +643,10 @@ app.post('/generate/stream', async (req: Request, res: Response, next: NextFunct
         res.write(`event: token\n`);
         res.write(`data: ${JSON.stringify({ token: chunk.data })}\n\n`);
       } else if (chunk.type === 'done') {
+        // Cache exactly what was streamed — regenerating here would silently
+        // cache a different (non-deterministic, temperature > 0) completion
+        // than what the caller actually received.
+        finalGen = { answer: chunk.answer ?? '', citations: chunk.citations ?? [], model: chunk.model ?? config.chat.model };
         res.write(`event: done\n`);
         res.write(`data: {}\n\n`);
       } else if (chunk.type === 'error') {
@@ -649,12 +654,7 @@ app.post('/generate/stream', async (req: Request, res: Response, next: NextFunct
         res.write(`data: ${JSON.stringify({ message: chunk.data })}\n\n`);
       }
     }
-    // Cache full generation after streaming
-    // Reconstruct answer from tokens if not cached.
-    // NOTE: We captured tokens via streaming; simpler is to regenerate once more or modify streamAnswer to expose final answer.
-    // For now we regenerate once to store (small overhead acceptable initial version).
-    const final = await generateAnswer(prompt, { temperature, maxTokens });
-    generationCache.set(gKey, final);
+    if (finalGen) generationCache.set(gKey, finalGen);
     res.end();
   } catch (err) { next(err); }
 });
@@ -805,6 +805,7 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
     const resultsMap = new Map<number, (typeof results)[number]>();
     results.forEach((r: any, idx: number) => resultsMap.set(idx + 1, r));
   const effectiveMaxTokens = maxTokens ?? (isLikelyLowWeightMessage(userText) ? 70 : undefined);
+  let finalAnswer: string | null = null;
   for await (const chunk of streamChatAnswer(prompt, history, { temperature, maxTokens: effectiveMaxTokens, topP, presencePenalty, frequencyPenalty })) {
       if (controller.signal.aborted) break;
       if (chunk.type === 'start') {
@@ -825,6 +826,11 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
         res.write(`event: token\n`);
         res.write(`data: ${JSON.stringify({ token: chunk.data })}\n\n`);
       } else if (chunk.type === 'done') {
+        // Persist exactly what was streamed — regenerating here would silently
+        // save a different (non-deterministic, temperature > 0) completion than
+        // what the user actually saw, which is what caused live answers and
+        // Journal history to visibly diverge.
+        finalAnswer = chunk.answer ?? '';
         res.write(`event: done\n`);
         res.write(`data: {}\n\n`);
       } else if (chunk.type === 'error') {
@@ -832,10 +838,10 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
         res.write(`data: ${JSON.stringify({ message: chunk.data })}\n\n`);
       }
     }
-    // After stream, finalize and store assistant message (regenerate once for cache consistency)
-  const final = await generateChatAnswer(prompt, history, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty });
-    const updatedThread = addMessage(id, { role: 'assistant', content: final.answer });
-    maybeRefreshCoachingSummary(id, updatedThread?.userTurnCount ?? t.userTurnCount);
+    if (finalAnswer !== null) {
+      const updatedThread = addMessage(id, { role: 'assistant', content: finalAnswer });
+      maybeRefreshCoachingSummary(id, updatedThread?.userTurnCount ?? t.userTurnCount);
+    }
     res.end();
   } catch (err) { next(err); }
 });
