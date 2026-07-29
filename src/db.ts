@@ -6,6 +6,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 
 const DB_PATH = process.env.DB_PATH || path.resolve('.cache/maxwell.db');
 
@@ -86,10 +87,24 @@ db.exec(`
     createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
   );
 
+  CREATE TABLE IF NOT EXISTS saved_insights (
+    id           TEXT PRIMARY KEY,
+    userId       TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
+  CREATE TABLE IF NOT EXISTS device_tokens (
+    userId       TEXT PRIMARY KEY,
+    token        TEXT NOT NULL,
+    createdAt    INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
   CREATE INDEX IF NOT EXISTS idx_summaries_user ON coaching_summaries(userId, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_goals_user ON user_goals(userId, status);
   CREATE INDEX IF NOT EXISTS idx_analytics_type ON analytics_events(eventType, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_ratings_thread ON response_ratings(threadId);
+  CREATE INDEX IF NOT EXISTS idx_saved_insights_user ON saved_insights(userId, createdAt DESC);
   CREATE INDEX IF NOT EXISTS idx_reflections_user ON reflection_answers(userId, createdAt DESC);
 `);
 
@@ -156,6 +171,57 @@ export function getReflectionAnswers(userId: string): Array<{ questionId: string
     SELECT questionId, question, answer, createdAt FROM reflection_answers
     WHERE userId = ? ORDER BY createdAt ASC
   `).all(userId) as Array<{ questionId: string; question: string; answer: string; createdAt: number }>;
+}
+
+export function saveInsight(userId: string, id: string, text: string): void {
+  db.prepare(`INSERT OR REPLACE INTO saved_insights (id, userId, text) VALUES (?, ?, ?)`).run(id, userId, text);
+}
+
+export function deleteInsight(userId: string, id: string): void {
+  db.prepare(`DELETE FROM saved_insights WHERE id = ? AND userId = ?`).run(id, userId);
+}
+
+export function getSavedInsights(userId: string): Array<{ id: string; text: string; createdAt: number }> {
+  return db.prepare(`
+    SELECT id, text, createdAt FROM saved_insights
+    WHERE userId = ? ORDER BY createdAt DESC
+  `).all(userId) as Array<{ id: string; text: string; createdAt: number }>;
+}
+
+export function deleteAllUserData(userId: string): void {
+  db.prepare('DELETE FROM user_profiles WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM coaching_summaries WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM user_goals WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM reflection_answers WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM saved_insights WHERE userId = ?').run(userId);
+  db.prepare('DELETE FROM device_tokens WHERE userId = ?').run(userId);
+}
+
+// Lightweight per-user auth: not a login system, just a private bearer token
+// tied to a userId so that knowing/guessing a userId alone (previously the
+// only thing standing between any client and that user's data, since every
+// client shares one API key) is no longer enough. First registration for a
+// userId wins and is permanent; there's no re-issue/rotate flow.
+export function registerDeviceToken(userId: string): string {
+  const existing = db.prepare('SELECT token FROM device_tokens WHERE userId = ?').get(userId) as { token: string } | undefined;
+  if (existing) return existing.token;
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('INSERT INTO device_tokens (userId, token) VALUES (?, ?)').run(userId, token);
+  return token;
+}
+
+export function hasDeviceToken(userId: string): boolean {
+  return !!db.prepare('SELECT 1 FROM device_tokens WHERE userId = ?').get(userId);
+}
+
+export function isValidUserToken(userId: string, token: string): boolean {
+  const row = db.prepare('SELECT token FROM device_tokens WHERE userId = ?').get(userId) as { token: string } | undefined;
+  return !!row && row.token === token;
+}
+
+export function getGoalOwner(id: number): string | undefined {
+  const row = db.prepare('SELECT userId FROM user_goals WHERE id = ?').get(id) as { userId: string } | undefined;
+  return row?.userId;
 }
 
 export function saveCoachingSummary(userId: string, threadId: string, summary: string, turnCount: number): void {

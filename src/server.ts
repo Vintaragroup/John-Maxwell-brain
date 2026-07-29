@@ -9,19 +9,19 @@ import { fetchWebPage, ingestText, ingestPdf, ingestTranscript } from './ingest'
 import { toChunks } from './parse';
 import { indexChunks, search, searchDetailed, getIndexStats } from './retrieve';
 import { LRUCache, makeRetrievalKey } from './cache';
-import { buildPrompt } from './prompt';
+import { buildPrompt, isLikelyLowWeightMessage } from './prompt';
 import { dedupStats } from './dedup';
-import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage } from './generate';
+import { generateAnswer, generateChatAnswer, streamAnswer, streamChatAnswer, extractProfileReflection, ChatMessage, GeneratedAnswer } from './generate';
 import { getMemory, upsertMemory, listMemories, recordFeedback, decayPreferences } from './memory';
 import { listConfigHistory, currentRuntimeConfig, updateRuntimeConfig } from './admin_config';
-import { createThread, addMessage, getThread, getHistory, listThreads, setThreadUser, setCoachingSummary, getCoachingSummary } from './conversation';
+import { createThread, addMessage, getThread, getHistory, listThreads, setThreadUser, setCoachingSummary, getCoachingSummary, deleteThreadsForUser } from './conversation';
 import { synthesizeSpeech } from './voice';
 import { getDateTime, getWeather } from './context';
 import { getRelevantPersonaSnippet } from './persona';
 import { UserProfile } from './types';
 import fs from 'fs';
 import { checkRateLimit, remainingTokens } from './rate_limit';
-import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers } from './db';
+import { upsertProfile, getProfile as getDbProfile, saveCoachingSummary, getRecentCoachingSummaries, addGoal, getActiveGoals, updateGoalStatus, needsGoalCheckIn, markGoalChecked, trackEvent, getAnalyticsSummary, saveRating, saveReflectionAnswer, getReflectionAnswers, saveInsight, deleteInsight, getSavedInsights, deleteAllUserData, registerDeviceToken, hasDeviceToken, isValidUserToken, getGoalOwner } from './db';
 
 const app = express();
 // CORS for frontend apps
@@ -116,6 +116,30 @@ app.get('/corpus/stats', (_req: Request, res: Response) => {
 // --- Simple in-memory user profiles ---
 const profiles = new Map<string, UserProfile>();
 
+// Verifies the caller owns `userId` before letting a request touch their data.
+// A userId with no registered token yet is "unclaimed" and passes through —
+// this is what lets a client's freshly-generated userId work on its very
+// first request, before /device/register has necessarily been called for it.
+// Once a token IS registered for a userId, only a matching x-user-token can
+// act as that user. Sends the 401 response itself when verification fails.
+function verifyUserToken(req: Request, res: Response, userId: string | undefined): boolean {
+  if (!userId) return true;
+  if (!hasDeviceToken(userId)) return true;
+  const token = req.headers['x-user-token'] as string | undefined;
+  if (!token || !isValidUserToken(userId, token)) {
+    res.status(401).json({ error: { code: 'INVALID_USER_TOKEN', message: 'Missing or invalid user token for this userId' } });
+    return false;
+  }
+  return true;
+}
+
+app.post('/device/register', (req: Request, res: Response) => {
+  const userId = String(req.body?.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  const token = registerDeviceToken(userId);
+  res.json({ token });
+});
+
 function normalizeProfile(input: any, fallbackUserId?: string): UserProfile | undefined {
   const resolvedUserId = input?.userId ? String(input.userId) : fallbackUserId;
   if (!resolvedUserId) return undefined;
@@ -147,18 +171,29 @@ function normalizeProfile(input: any, fallbackUserId?: string): UserProfile | un
   };
 }
 
-function buildOpeningMessage(profile?: UserProfile, recentSummaries?: string[]): string {
+function omitUndefined<T extends object>(obj: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const key of Object.keys(obj) as (keyof T)[]) {
+    if (obj[key] !== undefined) out[key] = obj[key];
+  }
+  return out;
+}
+
+function buildOpeningMessage(profile?: UserProfile, recentSummaries?: string[], goalToCheckIn?: { title: string }): string {
   const isReturning = recentSummaries && recentSummaries.length > 0;
+  if (goalToCheckIn && profile?.firstName) {
+    return `Good to see you again, ${profile.firstName}. How's it going with "${goalToCheckIn.title}"?`;
+  }
   if (isReturning && profile?.firstName) {
-    return `Welcome back, ${profile.firstName}. Last time we talked, ${recentSummaries[0]} I've been thinking about that. Where are you now with it?`;
+    return `Welcome back, ${profile.firstName}. ${recentSummaries[0]} How are things now?`;
   }
   if (profile?.firstName && profile.currentChallenge) {
-    return `${profile.firstName}, welcome. I've been thinking about leaders who face ${profile.currentChallenge}. Let me ask you — what would it mean to you personally if you made a real breakthrough there?`;
+    return `Hey ${profile.firstName}, good to see you. How have things been with ${profile.currentChallenge}?`;
   }
   if (profile?.firstName) {
-    return `${profile.firstName}, I'm glad you're here. I'm John Maxwell. Before we dive in — what's the one area of your leadership you most want to grow in right now?`;
+    return `${profile.firstName}, glad you're here. What's on your mind today?`;
   }
-  return "I'm glad you're here. I'm John Maxwell — I've spent over 50 years studying and teaching leadership. Before we dive in, I want to make this personal. What's your first name?";
+  return "Good to have you here. I'm John Maxwell — I've spent over 50 years studying and teaching leadership. What should I call you?";
 }
 
 function maybeRefreshCoachingSummary(id: string, userTurnCount: number): void {
@@ -182,6 +217,7 @@ function maybeRefreshCoachingSummary(id: string, userTurnCount: number): void {
 app.get('/profile', (req: Request, res: Response) => {
   const userId = String((req.query.userId || '').toString() || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   const memProfile = profiles.get(userId);
   const dbProfile = !memProfile ? getDbProfile(userId) : undefined;
   if (dbProfile && !memProfile) profiles.set(userId, { ...dbProfile } as UserProfile);
@@ -191,6 +227,7 @@ app.get('/profile', (req: Request, res: Response) => {
 app.post('/profile', (req: Request, res: Response) => {
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, String(userId))) return;
   const p = normalizeProfile(req.body, String(userId));
   if (!p) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
   profiles.set(p.userId, p);
@@ -210,6 +247,7 @@ const ReflectSchema = z.object({
 app.post('/profile/reflect', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId, questionId, question, answer } = ReflectSchema.parse(req.body ?? {});
+    if (!verifyUserToken(req, res, userId)) return;
     const existing: UserProfile = profiles.get(userId) || (getDbProfile(userId) as UserProfile | undefined) || { userId };
     const result = await extractProfileReflection({
       existingProfile: existing,
@@ -244,12 +282,14 @@ app.post('/profile/reflect', async (req: Request, res: Response, next: NextFunct
 app.get('/profile/reflect', (req: Request, res: Response) => {
   const userId = String((req.query.userId || '').toString() || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   res.json({ answers: getReflectionAnswers(userId) });
 });
 
 app.get('/goals', (req: Request, res: Response) => {
   const userId = String(req.query.userId || '');
   if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
   res.json({ goals: getActiveGoals(userId) });
 });
 
@@ -263,6 +303,7 @@ const GoalSchema = z.object({
 app.post('/goals', (req: Request, res: Response) => {
   try {
     const { userId, title, description, targetDate } = GoalSchema.parse(req.body ?? {});
+    if (!verifyUserToken(req, res, userId)) return;
     const id = addGoal({ userId, title, description, targetDate });
     res.json({ ok: true, id });
   } catch (_err) {
@@ -274,8 +315,54 @@ app.patch('/goals/:id', (req: Request, res: Response) => {
   const id = Number(req.params.id);
   const { status } = req.body || {};
   if (!['active', 'achieved', 'paused'].includes(status)) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid status' } });
+  const owner = getGoalOwner(id);
+  if (!verifyUserToken(req, res, owner)) return;
   updateGoalStatus(id, status);
   res.json({ ok: true });
+});
+
+app.get('/insights', (req: Request, res: Response) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
+  res.json({ insights: getSavedInsights(userId) });
+});
+
+const SaveInsightSchema = z.object({
+  userId: z.string().min(1),
+  id: z.string().min(1),
+  text: z.string().min(1)
+});
+
+app.post('/insights', (req: Request, res: Response) => {
+  try {
+    const { userId, id, text } = SaveInsightSchema.parse(req.body ?? {});
+    if (!verifyUserToken(req, res, userId)) return;
+    saveInsight(userId, id, text);
+    res.json({ ok: true });
+  } catch (_err) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid insight data' } });
+  }
+});
+
+app.delete('/insights/:id', (req: Request, res: Response) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
+  deleteInsight(userId, req.params.id);
+  res.json({ ok: true });
+});
+
+// Wipes everything Brain knows about a user: profile, goals, reflections,
+// saved insights, and every conversation thread. Irreversible.
+app.delete('/user-data', (req: Request, res: Response) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing userId' } });
+  if (!verifyUserToken(req, res, userId)) return;
+  profiles.delete(userId);
+  deleteAllUserData(userId);
+  const threadsDeleted = deleteThreadsForUser(userId);
+  res.json({ ok: true, threadsDeleted });
 });
 
 app.get('/admin/analytics', (_req: Request, res: Response) => {
@@ -301,8 +388,33 @@ app.post('/rate', (req: Request, res: Response) => {
 });
 
 // Helper: build prompt with personal touch and dynamic context
-async function buildPersonalizedPrompt(query: string, results: Array<{ chunk: any; score: number }>, userId?: string, threadId?: string) {
-  const prompt = buildPrompt(query, results);
+// Lightweight, zero-cost keyword pass — not a real classifier, just a reliable
+// floor so the system prompt's empathy branch fires on clear distress signals
+// instead of depending entirely on the model inferring tone from context.
+const DISTRESS_PATTERNS: Array<{ pattern: RegExp; signal: string }> = [
+  { pattern: /\bburn(?:ed|t)?[\s-]?out\b/i, signal: 'feeling burned out' },
+  { pattern: /\boverwhelm(?:ed|ing)?\b/i, signal: 'feeling overwhelmed' },
+  { pattern: /\b(?:can'?t (?:do|handle|take) (?:this|it) anymore|giving up|about to give up)\b/i, signal: 'considering giving up' },
+  { pattern: /\b(?:i(?:'m| am) a failure|i failed|failing (?:as|at))\b/i, signal: 'feeling like a failure' },
+  { pattern: /\b(?:hopeless|pointless|no point (?:in|to))\b/i, signal: 'feeling hopeless' },
+  { pattern: /\b(?:scared|afraid|terrified|anxious|anxiety)\b/i, signal: 'feeling anxious or afraid' },
+  { pattern: /\bstress(?:ed)?(?: out)?\b/i, signal: 'feeling stressed' },
+  { pattern: /\b(?:exhausted|drained|depleted)\b/i, signal: 'feeling exhausted' },
+  { pattern: /\b(?:alone|isolated|no one (?:understands|gets it))\b/i, signal: 'feeling alone or unsupported' },
+  { pattern: /\b(?:so (?:angry|mad|furious)|frustrat(?:ed|ing))\b/i, signal: 'feeling frustrated or angry' }
+];
+
+function detectEmotionalSignal(text: string): string | undefined {
+  for (const { pattern, signal } of DISTRESS_PATTERNS) {
+    if (pattern.test(text)) return signal;
+  }
+  return undefined;
+}
+
+
+async function buildPersonalizedPrompt(query: string, results: Array<{ chunk: any; score: number }>, userId?: string, threadId?: string, opts: { isFirstMessage?: boolean } = {}) {
+  const emotionalSignal = detectEmotionalSignal(query);
+  const prompt = buildPrompt(query, results, { isFirstMessage: opts.isFirstMessage, emotionalSignal });
   let nameFrag = '';
   let contextFrag = '';
   let personaFrag = '';
@@ -509,6 +621,7 @@ app.post('/generate/stream', async (req: Request, res: Response, next: NextFunct
       return;
     }
   const stream = history && history.length ? streamChatAnswer(prompt, history as ChatMessage[], { temperature, maxTokens, topP, presencePenalty, frequencyPenalty }) : streamAnswer(prompt, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty });
+    let finalGen: GeneratedAnswer | null = null;
     for await (const chunk of stream) {
       if (controller.signal.aborted) break;
       if (chunk.type === 'start') {
@@ -530,6 +643,10 @@ app.post('/generate/stream', async (req: Request, res: Response, next: NextFunct
         res.write(`event: token\n`);
         res.write(`data: ${JSON.stringify({ token: chunk.data })}\n\n`);
       } else if (chunk.type === 'done') {
+        // Cache exactly what was streamed — regenerating here would silently
+        // cache a different (non-deterministic, temperature > 0) completion
+        // than what the caller actually received.
+        finalGen = { answer: chunk.answer ?? '', citations: chunk.citations ?? [], model: chunk.model ?? config.chat.model };
         res.write(`event: done\n`);
         res.write(`data: {}\n\n`);
       } else if (chunk.type === 'error') {
@@ -537,12 +654,7 @@ app.post('/generate/stream', async (req: Request, res: Response, next: NextFunct
         res.write(`data: ${JSON.stringify({ message: chunk.data })}\n\n`);
       }
     }
-    // Cache full generation after streaming
-    // Reconstruct answer from tokens if not cached.
-    // NOTE: We captured tokens via streaming; simpler is to regenerate once more or modify streamAnswer to expose final answer.
-    // For now we regenerate once to store (small overhead acceptable initial version).
-    const final = await generateAnswer(prompt, { temperature, maxTokens });
-    generationCache.set(gKey, final);
+    if (finalGen) generationCache.set(gKey, finalGen);
     res.end();
   } catch (err) { next(err); }
 });
@@ -558,17 +670,27 @@ app.post('/conversation/start', (req: Request, res: Response) => {
   const resolvedUserId = userId ? String(userId)
     : (profile?.userId ? String(profile.userId)
     : (profile ? 'u_' + Math.random().toString(36).slice(2, 10) : undefined));
+  if (!verifyUserToken(req, res, resolvedUserId)) return;
   const initial = Array.isArray(seed) ? seed : [];
+  const existingProfile = resolvedUserId
+    ? (profiles.get(resolvedUserId) || (getDbProfile(resolvedUserId) as UserProfile | undefined))
+    : undefined;
+  // Merge rather than replace: normalizeProfile() always returns a truthy object
+  // once a userId resolves, even when the caller passed no profile fields at all
+  // (every field just comes back undefined). Blindly overwriting the cache with
+  // that would wipe already-known fields like currentChallenge whenever a client
+  // starts a conversation before its local profile state has hydrated.
   const normalizedProfile = normalizeProfile(profile, resolvedUserId);
-  if (normalizedProfile) profiles.set(normalizedProfile.userId, normalizedProfile);
-  const cachedProfile = resolvedUserId ? profiles.get(resolvedUserId) : undefined;
-  const dbProfile = !normalizedProfile && resolvedUserId && !cachedProfile ? getDbProfile(resolvedUserId) : undefined;
-  if (dbProfile && resolvedUserId && !cachedProfile) profiles.set(resolvedUserId, { ...dbProfile } as UserProfile);
-  const openingProfile = normalizedProfile || cachedProfile || (dbProfile ? ({ ...dbProfile } as UserProfile) : undefined);
+  const openingProfile = normalizedProfile
+    ? ({ ...(existingProfile || {}), ...omitUndefined(normalizedProfile) } as UserProfile)
+    : existingProfile;
+  if (openingProfile && resolvedUserId) profiles.set(resolvedUserId, openingProfile);
   const recentSummaries = resolvedUserId ? getRecentCoachingSummaries(resolvedUserId, 1).map(s => s.summary) : [];
+  const goalToCheckIn = resolvedUserId && needsGoalCheckIn(resolvedUserId) ? getActiveGoals(resolvedUserId)[0] : undefined;
+  if (goalToCheckIn && resolvedUserId) markGoalChecked(resolvedUserId);
   const opening: ChatMessage = {
     role: 'assistant',
-    content: buildOpeningMessage(openingProfile, recentSummaries)
+    content: buildOpeningMessage(openingProfile, recentSummaries, goalToCheckIn)
   };
   const t = createThread(resolvedUserId, [opening, ...initial]);
   res.json({ id: t.id, openingMessage: opening.content });
@@ -576,12 +698,14 @@ app.post('/conversation/start', (req: Request, res: Response) => {
 
 app.get('/conversation', (req: Request, res: Response) => {
   const userId = req.query.userId ? String(req.query.userId) : undefined;
+  if (!verifyUserToken(req, res, userId)) return;
   res.json({ threads: listThreads(50, userId) });
 });
 
 app.get('/conversation/:id', (req: Request, res: Response) => {
   const t = getThread(req.params.id);
   if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+  if (!verifyUserToken(req, res, t.userId)) return;
   res.json({ thread: t });
 });
 
@@ -592,6 +716,7 @@ app.post('/conversation/:id/send', async (req: Request, res: Response, next: Nex
     if (!query) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing query' } });
     const t = getThread(id);
     if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+    if (!verifyUserToken(req, res, t.userId)) return;
     // If this is the first user response and we don't have a userId yet, try to capture first name.
     const userText = String(query);
     // Very light name extraction: first token up to punctuation, alphabetic only
@@ -605,6 +730,7 @@ app.post('/conversation/:id/send', async (req: Request, res: Response, next: Nex
         profiles.set(newUserId, { userId: newUserId, firstName });
       }
     }
+    const isFirstUserMessage = t.userTurnCount === 0;
     addMessage(id, { role: 'user', content: userText });
     let results: Array<{ chunk: any; score: number }> = [];
     if (config.content.retrievalEnabled) {
@@ -614,9 +740,10 @@ app.post('/conversation/:id/send', async (req: Request, res: Response, next: Nex
       const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
       results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
     }
-  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id);
+  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id, { isFirstMessage: isFirstUserMessage });
     const history = getHistory(id);
-  const gen = await generateChatAnswer(prompt, history, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty });
+  const effectiveMaxTokens = maxTokens ?? (isLikelyLowWeightMessage(userText) ? 70 : undefined);
+  const gen = await generateChatAnswer(prompt, history, { temperature, maxTokens: effectiveMaxTokens, topP, presencePenalty, frequencyPenalty });
     const updatedThread = addMessage(id, { role: 'assistant', content: gen.answer });
     trackEvent({ eventType: 'query', userId: t.userId, model: gen.model, chunkIds: results.map(r => r.chunk.id), isStub: gen.model === 'stub-local' });
     maybeRefreshCoachingSummary(id, updatedThread?.userTurnCount ?? t.userTurnCount);
@@ -645,6 +772,7 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
     if (!query) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Missing query' } });
     const t = getThread(id);
     if (!t) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Conversation not found' } });
+    if (!verifyUserToken(req, res, t.userId)) return;
     const userText = String(query);
     if (!t.userId) {
       const m = userText.match(/^(?:hi|hello|hey|it'?s|i am|i'm|my name is|name's)?\s*([A-Za-z\-']{2,})(?:[\s,!.?]|$)/i);
@@ -655,6 +783,7 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
         profiles.set(newUserId, { userId: newUserId, firstName });
       }
     }
+    const isFirstUserMessage = t.userTurnCount === 0;
     addMessage(id, { role: 'user', content: userText });
     let results: Array<{ chunk: any; score: number }> = [];
     if (config.content.retrievalEnabled) {
@@ -664,7 +793,7 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
       const detailed = await searchDetailed(query, topK, t.userId, { alpha, beta, gamma });
       results = detailed.map(d => ({ chunk: d.chunk, score: d.score }));
     }
-  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id);
+  const prompt = await buildPersonalizedPrompt(query, results, t.userId, id, { isFirstMessage: isFirstUserMessage });
     const history = getHistory(id);
     // SSE setup
     res.setHeader('Content-Type', 'text/event-stream');
@@ -675,7 +804,9 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
     req.on('close', () => controller.abort());
     const resultsMap = new Map<number, (typeof results)[number]>();
     results.forEach((r: any, idx: number) => resultsMap.set(idx + 1, r));
-  for await (const chunk of streamChatAnswer(prompt, history, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty })) {
+  const effectiveMaxTokens = maxTokens ?? (isLikelyLowWeightMessage(userText) ? 70 : undefined);
+  let finalAnswer: string | null = null;
+  for await (const chunk of streamChatAnswer(prompt, history, { temperature, maxTokens: effectiveMaxTokens, topP, presencePenalty, frequencyPenalty })) {
       if (controller.signal.aborted) break;
       if (chunk.type === 'start') {
         const citations = (chunk.citations || []).map((c: any) => {
@@ -695,6 +826,11 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
         res.write(`event: token\n`);
         res.write(`data: ${JSON.stringify({ token: chunk.data })}\n\n`);
       } else if (chunk.type === 'done') {
+        // Persist exactly what was streamed — regenerating here would silently
+        // save a different (non-deterministic, temperature > 0) completion than
+        // what the user actually saw, which is what caused live answers and
+        // Journal history to visibly diverge.
+        finalAnswer = chunk.answer ?? '';
         res.write(`event: done\n`);
         res.write(`data: {}\n\n`);
       } else if (chunk.type === 'error') {
@@ -702,10 +838,10 @@ app.post('/conversation/:id/stream', async (req: Request, res: Response, next: N
         res.write(`data: ${JSON.stringify({ message: chunk.data })}\n\n`);
       }
     }
-    // After stream, finalize and store assistant message (regenerate once for cache consistency)
-  const final = await generateChatAnswer(prompt, history, { temperature, maxTokens, topP, presencePenalty, frequencyPenalty });
-    const updatedThread = addMessage(id, { role: 'assistant', content: final.answer });
-    maybeRefreshCoachingSummary(id, updatedThread?.userTurnCount ?? t.userTurnCount);
+    if (finalAnswer !== null) {
+      const updatedThread = addMessage(id, { role: 'assistant', content: finalAnswer });
+      maybeRefreshCoachingSummary(id, updatedThread?.userTurnCount ?? t.userTurnCount);
+    }
     res.end();
   } catch (err) { next(err); }
 });

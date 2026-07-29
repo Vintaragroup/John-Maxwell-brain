@@ -52,7 +52,12 @@ function scheduleSave() {
     try {
       if (!dirty) return;
       ensureDir(STORE_PATH);
-      const arr = Array.from(threads.values());
+      // A thread is created immediately on /conversation/start (before the user
+      // has said anything), so every abandoned session — someone who opens the
+      // app and never asks a question — would otherwise persist forever. Only
+      // write threads that have at least one real exchange; abandoned ones stay
+      // in-memory for this process's lifetime but never bloat the disk store.
+      const arr = Array.from(threads.values()).filter(t => t.userTurnCount > 0);
       fs.writeFileSync(STORE_PATH, JSON.stringify(arr));
       dirty = false;
     } catch {
@@ -139,6 +144,21 @@ function trimThread(t: ConversationThread, maxTokensApprox = 4000, maxMessages =
     const m = t.messages.shift();
     total -= m ? m.content.length : 0;
   }
+}
+
+export function deleteThreadsForUser(userId: string): number {
+  let count = 0;
+  for (const [id, t] of threads) {
+    if (t.userId === userId) {
+      threads.delete(id);
+      count++;
+    }
+  }
+  if (count > 0) {
+    dirty = true;
+    scheduleSave();
+  }
+  return count;
 }
 
 export function listThreads(limit = 50, userId?: string) {
